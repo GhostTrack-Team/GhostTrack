@@ -31,7 +31,7 @@ vulnerable road users in these blind zones and alert the driver in real time.
 
 ## Demo
 - Live Site: https://ghosttruck.onrender.com
-- 3D Model: https://leharinshainsha05-stack.github.io/indian-lorry-blindspot/
+- 3D Model:  https://ghosttrack-team.github.io/indian-lorry-blindspot/
 
 ## License
 © 2025 Leharin, Rajamaran, Sumith. All rights reserved.  
