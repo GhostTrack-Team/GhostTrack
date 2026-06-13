@@ -19,9 +19,9 @@ vulnerable road users in these blind zones and alert the driver in real time.
 6. **Driver gets alerted** in real time to avoid accidents
 
 ## Team
-- Leharin (B.Tech CSE, AEMT University, Chennai)
-- Rajamaran (B.Tech SE, AEMT University, Chennai)
-- Sumith (B.Tech SE, AEMT University, Chennai)
+- Leharin (B.Tech CSE, AMET University, Chennai) - Team Leader
+- Rajamaran (B.Tech SE, AMET University, Chennai)
+- Sumith (B.Tech SE, AMET University, Chennai)
 
 ## Tech Stack
 - YOLOv8 (COCO + custom ghosttrack_best.pt)
