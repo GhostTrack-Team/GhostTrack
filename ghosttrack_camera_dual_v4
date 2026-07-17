@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+# =============================================================================
+# GHOSTTRACK — RASPBERRY PI 5 DUAL CAMERA LOOP CODE
+# Version 3 — Browser live stream instead of cv2.imshow (VNC-safe)
+# =============================================================================
+# WHAT CHANGED FROM v2:
+#   - cv2.imshow() removed entirely. It relied on Qt/X11 GUI rendering, which
+#     was rendering solid black under VNC (a known VNC/Qt/GPU-passthrough
+#     quirk — the camera and detection were working fine the whole time,
+#     confirmed by test_frame.jpg).
+#   - Added a lightweight Flask web server running in a background thread.
+#     It serves the same annotated combined frame as an MJPEG stream at
+#     http://<pi-ip>:5000 — viewable from any browser, no VNC/X11 needed.
+#   - Keyboard 'q'/'h' toggle removed (it depended on an OpenCV window
+#     having focus, which no longer exists). Quit with Ctrl+C in the
+#     terminal. To change HIGHWAY_MODE, edit the constant below and restart.
+#
+# INSTALL THE ONE NEW DEPENDENCY FIRST:
+#   pip install flask --break-system-packages
+#
+# HOW TO RUN — same as before:
+#   python3 ghosttrack_camera_dual_v3.py
+#
+# THEN VIEW THE LIVE FEED:
+#   Open a browser on your phone/laptop (same WiFi network as the Pi) and go to:
+#   http://<pi-ip-address>:5000
+#   (run "hostname -I" on the Pi to get its IP if you don't have it handy)
+# =============================================================================
+
+import cv2
+import csv
+import datetime
+import time
+import serial
+import threading
+import numpy as np
+from ultralytics import YOLO
+from picamera2 import Picamera2
+from flask import Flask, Response
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+MODEL_COCO_PATH  = 'yolov8n.pt'
+MODEL_GHOST_PATH = '/home/pi/ghosttrack_best.onnx'
+
+CAMERA_LEFT_NUM  = 0
+CAMERA_RIGHT_NUM = 1
+FRAME_WIDTH      = 640
+FRAME_HEIGHT     = 480
+
+STREAM_PORT      = 5000   # browser live view: http://<pi-ip>:5000
+
+# ESP32 connection — direct GPIO UART wire link, NOT USB. The ESP32 firmware
+# listens for Pi messages on GPIO26(RX)/GPIO23(TX) via SoftwareSerial, a
+# separate physical path from its USB port. Requires Pi's hardware UART
+# enabled via raspi-config (Interface Options -> Serial Port -> hardware
+# yes, login shell no) and wiring: Pi GPIO14(TX)->ESP32 GPIO26, Pi
+# GPIO15(RX)<-ESP32 GPIO23, plus shared GND.
+#
+# IMPORTANT (Pi 5 only): /dev/serial0 does NOT point to the GPIO14/15 header
+# UART on Pi 5 — it defaults to ttyAMA10, a separate onboard debug UART
+# connector. The actual GPIO14/15 header UART is /dev/ttyAMA0. Confirmed
+# via loopback test (Pin8->Pin10 jumper, python pyserial round-trip) after
+# /dev/serial0 returned nothing despite correct wiring, correct alt-function
+# (pinctrl showed TXD0/RXD0), and confirmed-good jumper wires. This cost a
+# long debugging session — don't revert to /dev/serial0 on this board.
+ESP32_PORT    = '/dev/ttyAMA0'
+ESP32_BAUD    = 9600
+
+CONF_THRESHOLD = 0.30
+
+GHOST_LOG_PATH = '/home/pi/ghost_log_pi5.csv'
+
+HIGHWAY_MODE  = False   # edit this + restart script to switch modes
+
+# =============================================================================
+# STATIC-OBJECT FILTER (frame-to-frame motion tracking)
+# =============================================================================
+# A single-frame YOLO detection can't tell a walking pedestrian apart from a
+# parked bicycle, a poster, or a mannequin — the model just sees "bicycle" or
+# "person" in that one frame. This tracker follows each detection's centroid
+# across frames and requires BOTH:
+#   1) Enough consecutive frames tracked (filters one-off detection flicker)
+#   2) Enough total movement over that window (filters genuinely static objects)
+# before a detection is trusted enough to count toward an alert. Static or
+# newly-appeared-but-unconfirmed objects are still drawn on the video feed
+# (so you can see what the model sees) but excluded from ALERT/SAFE logic.
+TRACK_MATCH_DIST_PX   = 60     # max centroid movement between frames to
+                                # still count as "the same object"
+TRACK_MISS_FRAMES     = 8      # frames a track can go unmatched before
+                                # it's dropped entirely
+TRACK_MIN_FRAMES      = 4      # min consecutive frames tracked before a
+                                # detection is trusted at all
+TRACK_MIN_MOVEMENT_PX = 12     # min total centroid displacement over the
+                                # tracked window to be considered "moving"
+                                # (below this = treated as a static object)
+
+# =============================================================================
+# CLASS DEFINITIONS
+# =============================================================================
+
+COCO_CLASSES = {
+    0: 'person',
+    1: 'bicycle',
+    3: 'motorcycle',
+    2: 'car',
+    5: 'bus',
+    7: 'truck'
+}
+
+GHOST_CLASSES = {
+    0: 'person',
+    1: 'bicycle',
+    2: 'motorcycle',
+    3: 'auto_rickshaw',
+    4: 'e_rickshaw',
+    5: 'car',
+    6: 'lcv',
+    7: 'bus',
+    8: 'truck',
+    9: 'tractor'
+}
+
+VRU_CLASSES = {'person', 'bicycle', 'motorcycle', 'auto_rickshaw', 'e_rickshaw'}
+
+COLORS = {
+    'person':       (0,   0,  255),
+    'bicycle':      (0, 165,  255),
+    'motorcycle':   (0,   0,  200),
+    'auto_rickshaw':(255, 0,  150),
+    'e_rickshaw':   (200, 0,  200),
+    'car':          (0,  255,   0),
+    'bus':          (255, 200,  0),
+    'truck':        (100, 100, 100),
+    'tractor':      (0,  100, 200),
+    'lcv':          (0,  200, 100),
+}
+
+# =============================================================================
+# STATIC-OBJECT FILTER — simple centroid tracker (one instance per side)
+# =============================================================================
+# Lightweight by design (no external tracking library needed): matches each
+# frame's detections to existing tracks by nearest centroid of the same
+# class, within TRACK_MATCH_DIST_PX. Each track remembers its oldest and
+# newest centroid to measure total movement over its tracked lifetime.
+
+class SideTracker:
+    def __init__(self):
+        self.tracks = {}       # track_id -> track dict
+        self.next_id = 0
+
+    def _new_track(self, det, centroid):
+        track = {
+            'class':        det['class'],
+            'first_centroid': centroid,
+            'last_centroid':  centroid,
+            'frames_tracked': 1,
+            'misses':         0,
+        }
+        self.tracks[self.next_id] = track
+        tid = self.next_id
+        self.next_id += 1
+        return tid
+
+    def update(self, dets):
+        """
+        Match this frame's detections to existing tracks, age out stale
+        tracks, and return the SAME dets list with two extra keys added to
+        each detection: 'confirmed' (bool) and 'static' (bool).
+        """
+        used_track_ids = set()
+
+        for det in dets:
+            x1, y1, x2, y2 = det['box']
+            centroid = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+            # Find the closest unused track of the same class within range
+            best_id, best_dist = None, TRACK_MATCH_DIST_PX
+            for tid, track in self.tracks.items():
+                if tid in used_track_ids:
+                    continue
+                if track['class'] != det['class']:
+                    continue
+                lx, ly = track['last_centroid']
+                dist = ((centroid[0] - lx) ** 2 + (centroid[1] - ly) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_id, best_dist = tid, dist
+
+            if best_id is not None:
+                track = self.tracks[best_id]
+                track['last_centroid']  = centroid
+                track['frames_tracked'] += 1
+                track['misses'] = 0
+                used_track_ids.add(best_id)
+                tid = best_id
+            else:
+                tid = self._new_track(det, centroid)
+                used_track_ids.add(tid)
+
+            track = self.tracks[tid]
+            fx, fy = track['first_centroid']
+            lx, ly = track['last_centroid']
+            total_movement = ((lx - fx) ** 2 + (ly - fy) ** 2) ** 0.5
+
+            det['confirmed'] = track['frames_tracked'] >= TRACK_MIN_FRAMES
+            det['static']    = total_movement < TRACK_MIN_MOVEMENT_PX
+
+        # Age out tracks that weren't matched this frame
+        for tid in list(self.tracks.keys()):
+            if tid not in used_track_ids:
+                self.tracks[tid]['misses'] += 1
+                if self.tracks[tid]['misses'] > TRACK_MISS_FRAMES:
+                    del self.tracks[tid]
+
+        return dets
+
+tracker_left  = SideTracker()
+tracker_right = SideTracker()
+
+# =============================================================================
+# LOAD MODELS
+# =============================================================================
+
+print("=" * 55)
+print("  GHOSTTRACK Pi 5 Dual CSI Camera Loop — v3")
+print("  Browser live stream + mmWave Radar + ESP32")
+print("=" * 55)
+
+print("\nLoading YOLOv8n COCO model (person/bicycle/motorcycle)...")
+model_coco = YOLO(MODEL_COCO_PATH)
+print("✅ COCO model ready")
+
+print("Loading GhostTrack model (auto_rickshaw/tractor/Indian)...")
+model_ghost = YOLO(MODEL_GHOST_PATH)
+print("✅ GhostTrack model ready")
+
+# =============================================================================
+# CONNECT TO ESP32 VIA UART
+# =============================================================================
+
+esp32 = None
+try:
+    esp32 = serial.Serial(ESP32_PORT, ESP32_BAUD, timeout=1)
+    time.sleep(2)
+    print(f"✅ ESP32 connected on {ESP32_PORT}")
+except Exception as e:
+    print(f"⚠️  ESP32 not connected ({e})")
+    print("   Simulation mode — signals printed to terminal")
+
+# =============================================================================
+# OPEN BOTH CSI CAMERAS (Picamera2)
+# =============================================================================
+
+def open_camera(camera_num, label):
+    print(f"\nOpening {label} camera (CSI port {camera_num}, OV5647)...")
+    picam = Picamera2(camera_num=camera_num)
+    config = picam.create_video_configuration(
+        main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"}
+    )
+    picam.configure(config)
+    picam.start()
+    time.sleep(1)
+    print(f"✅ {label} camera opened at {FRAME_WIDTH}x{FRAME_HEIGHT}")
+    return picam
+
+try:
+    cam_left  = open_camera(CAMERA_LEFT_NUM,  "LEFT")
+    cam_right = open_camera(CAMERA_RIGHT_NUM, "RIGHT")
+except Exception as e:
+    print(f"❌ Camera not found or Picamera2 error: {e}")
+    print("   Check: rpicam-hello --list-cameras")
+    exit(1)
+
+def grab_frame(picam):
+    frame_rgb = picam.capture_array()
+    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+# =============================================================================
+# BROWSER LIVE STREAM (NEW — replaces cv2.imshow)
+# =============================================================================
+
+latest_frame = None
+frame_lock = threading.Lock()
+
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def index():
+    return """
+    <html><head><title>GhostTrack Live</title></head>
+    <body style="background:#111;text-align:center;margin:0;padding:20px;">
+      <h2 style="color:#00e676;font-family:sans-serif;">GHOSTTRACK — Live Blind Spot Feed</h2>
+      <img src="/stream" style="max-width:95%;border:2px solid #00e676;border-radius:8px;">
+    </body></html>
+    """
+
+def generate_mjpeg():
+    global latest_frame
+    while True:
+        with frame_lock:
+            if latest_frame is None:
+                time.sleep(0.05)
+                continue
+            ok, jpeg = cv2.imencode('.jpg', latest_frame)
+        if not ok:
+            continue
+        frame_bytes = jpeg.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+@flask_app.route('/stream')
+def stream():
+    return Response(generate_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=STREAM_PORT, threaded=True, use_reloader=False)
+
+threading.Thread(target=run_flask, daemon=True).start()
+print(f"✅ Browser live stream ready → http://<pi-ip>:{STREAM_PORT}")
+
+# =============================================================================
+# GHOST LOG SETUP
+# =============================================================================
+
+ghost_ready = False
+
+def write_ghost_log(timestamp, cls, dist, zone, side, conf, source):
+    global ghost_ready
+    if not ghost_ready:
+        with open(GHOST_LOG_PATH, 'w', newline='') as f:
+            csv.writer(f).writerow([
+                'timestamp', 'class', 'distance_m',
+                'zone', 'side', 'confidence', 'alert_type', 'source'
+            ])
+        ghost_ready = True
+    alert_type = 'CRITICAL' if zone == 'CRITICAL' else 'AWARENESS'
+    with open(GHOST_LOG_PATH, 'a', newline='') as f:
+        csv.writer(f).writerow([
+            timestamp, cls, f'{dist:.1f}',
+            zone, side, f'{conf:.2f}', alert_type, source
+        ])
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def estimate_distance(box_h_ratio):
+    if HIGHWAY_MODE:
+        if   box_h_ratio > 0.30: return 'CRITICAL', 2.0
+        elif box_h_ratio > 0.15: return 'NEAR',     5.0
+        else:                    return 'FAR',       9.0
+    else:
+        if   box_h_ratio > 0.40: return 'CRITICAL', 1.5
+        elif box_h_ratio > 0.20: return 'NEAR',     3.5
+        else:                    return 'FAR',       7.0
+
+def send_alert(side, zone):
+    signal = f'ALERT:{side}:{zone}\n'
+    if esp32 and esp32.is_open:
+        try:
+            esp32.write(signal.encode())
+        except Exception as e:
+            print(f"⚠️  UART write failed: {e}")
+    else:
+        print(f'  📡 [SIM] ESP32 → {signal.strip()}')
+
+def send_safe():
+    if esp32 and esp32.is_open:
+        try:
+            esp32.write(b'SAFE\n')
+        except Exception:
+            pass
+
+def run_detection(frame, side):
+    dets = []
+
+    # imgsz=320 (instead of default 640) cuts pixel count to a quarter —
+    # this is the main speed lever without dropping either model. Fine for
+    # close-range blind-spot detection; accuracy on small/far objects drops
+    # a bit, which is an acceptable tradeoff here.
+    r1 = model_coco(frame, conf=CONF_THRESHOLD, imgsz=320, verbose=False)[0]
+    for box in r1.boxes:
+        cid = int(box.cls[0])
+        if cid in COCO_CLASSES:
+            dets.append({
+                'class':  COCO_CLASSES[cid],
+                'conf':   float(box.conf[0]),
+                'box':    box.xyxy[0].tolist(),
+                'source': 'COCO',
+                'side':   side
+            })
+
+    r2 = model_ghost(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+    for box in r2.boxes:
+        cid   = int(box.cls[0])
+        cname = GHOST_CLASSES.get(cid, 'unknown')
+        if cname in ['auto_rickshaw', 'e_rickshaw', 'tractor', 'lcv']:
+            dets.append({
+                'class':  cname,
+                'conf':   float(box.conf[0]),
+                'box':    box.xyxy[0].tolist(),
+                'source': 'GHOST',
+                'side':   side
+            })
+
+    return dets
+
+def draw_annotations(frame, dets):
+    for d in dets:
+        x1, y1, x2, y2 = d['box']
+        is_filtered = d.get('static') or not d.get('confirmed', True)
+        # Static/unconfirmed detections drawn dim grey so it's visually
+        # obvious on the live stream which objects are being ignored by
+        # the static-object filter, vs. genuine moving VRU threats.
+        color = (120, 120, 120) if is_filtered else COLORS.get(d['class'], (200, 200, 200))
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+        suffix = ' [static]' if d.get('static') else (' [confirming]' if not d.get('confirmed', True) else '')
+        label = f"{d['class']} {d['conf']:.2f}{suffix}"
+        cv2.putText(frame, label, (int(x1), max(int(y1) - 6, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    return frame
+
+def draw_hud(frame, label, fps, worst_zone, vru_found):
+    h, w = frame.shape[:2]
+    bar_color = (0, 0, 200) if worst_zone == 'CRITICAL' else \
+                (0, 165, 0) if vru_found else (30, 30, 30)
+    cv2.rectangle(frame, (0, 0), (w, 40), bar_color, -1)
+    status_text = "CRITICAL" if worst_zone == 'CRITICAL' else \
+                  "VRU DETECTED" if vru_found else "SAFE"
+    cv2.putText(frame, f"{label}  |  {status_text}",
+                (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(frame, f"FPS: {fps:.1f}  |  {'HIGHWAY' if HIGHWAY_MODE else 'CITY'} MODE",
+                (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    return frame
+
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
+
+print(f"\n🚀 GhostTrack ACTIVE — monitoring LEFT + RIGHT blind spots")
+print(f"   Mode: {'HIGHWAY' if HIGHWAY_MODE else 'CITY'}")
+print(f"   Press Ctrl+C to stop\n")
+
+frame_count     = 0
+alert_count     = 0
+last_safe_sent  = 0
+fps_start       = time.time()
+last_alert_time = 0
+ALERT_COOLDOWN  = 0.5
+
+try:
+    while True:
+        frame_left  = grab_frame(cam_left)
+        frame_right = grab_frame(cam_right)
+
+        frame_count += 1
+        ts = datetime.datetime.now().isoformat()
+
+        dets_left  = run_detection(frame_left,  'LEFT')
+        dets_right = run_detection(frame_right, 'RIGHT')
+
+        # Static-object filter: track each side's detections across frames,
+        # tagging each det with 'confirmed' (tracked long enough to trust)
+        # and 'static' (hasn't moved enough to be a real VRU threat).
+        dets_left  = tracker_left.update(dets_left)
+        dets_right = tracker_right.update(dets_right)
+
+        all_dets   = dets_left + dets_right
+
+        vru_found  = False
+        # Tracked independently per side so a CRITICAL/NEAR detection on one
+        # side never gets silently overwritten by a detection on the other
+        # side in the same frame. 'FAR' = nothing alert-worthy on that side.
+        left_alert_zone  = 'FAR'
+        right_alert_zone = 'FAR'
+
+        for d in all_dets:
+            x1, y1, x2, y2 = d['box']
+            frame_h = frame_left.shape[0] if d['side'] == 'LEFT' else frame_right.shape[0]
+            bh   = (y2 - y1) / frame_h
+            zone, dist = estimate_distance(bh)
+            cname = d['class']
+            side  = d['side']
+
+            write_ghost_log(ts, cname, dist, zone, side, d['conf'], d['source'])
+
+            # Static-object filter: only detections that have been tracked
+            # for enough frames AND have actually moved enough count toward
+            # an alert. Unconfirmed/static detections are still logged and
+            # drawn on the video (see draw_annotations) but never trigger
+            # ALERT/SAFE logic — this eliminates false positives from
+            # parked bikes, posters, mannequins, etc.
+            if cname in VRU_CLASSES and d.get('confirmed') and not d.get('static'):
+                vru_found = True
+                alert_count += 1
+
+                # Keep the worst (CRITICAL beats NEAR) zone seen so far on
+                # THIS side only — left and right never overwrite each other.
+                if side == 'LEFT':
+                    if zone == 'CRITICAL' or (zone == 'NEAR' and left_alert_zone != 'CRITICAL'):
+                        left_alert_zone = zone
+                else:  # RIGHT
+                    if zone == 'CRITICAL' or (zone == 'NEAR' and right_alert_zone != 'CRITICAL'):
+                        right_alert_zone = zone
+
+                print(f"  ⚠️  {cname.upper()} | {side} | "
+                      f"{dist:.1f}m ({zone}) | conf:{d['conf']:.2f} | [{d['source']}]")
+            elif cname in VRU_CLASSES and d.get('static'):
+                # Visible in terminal for debugging/tuning, doesn't count
+                # toward alerts.
+                print(f"  ⏸️  {cname.upper()} | {side} | STATIC — ignored")
+
+        # ── Decide side + zone to send to the ESP32, now that BOTH sides'
+        # worst zones for this frame are known — this is what lets us send
+        # "BOTH" instead of silently dropping one side's detection. ────────
+        left_active  = left_alert_zone  in ('CRITICAL', 'NEAR')
+        right_active = right_alert_zone in ('CRITICAL', 'NEAR')
+
+        if left_active and right_active:
+            worst_side = 'BOTH'
+            worst_zone = 'CRITICAL' if 'CRITICAL' in (left_alert_zone, right_alert_zone) else 'NEAR'
+        elif left_active:
+            worst_side = 'LEFT'
+            worst_zone = left_alert_zone
+        elif right_active:
+            worst_side = 'RIGHT'
+            worst_zone = right_alert_zone
+        else:
+            worst_side = 'NONE'
+            worst_zone = 'FAR'
+
+        now = time.time()
+        if vru_found and worst_zone in ('CRITICAL', 'NEAR'):
+            if now - last_alert_time >= ALERT_COOLDOWN:
+                send_alert(worst_side, worst_zone)
+                last_alert_time = now
+        else:
+            if now - last_safe_sent > 2.0:
+                send_safe()
+                last_safe_sent = now
+
+        # ── BUILD COMBINED FRAME FOR BROWSER STREAM ──────────────────────
+        fps = frame_count / (time.time() - fps_start)
+
+        frame_left  = draw_annotations(frame_left,  dets_left)
+        frame_right = draw_annotations(frame_right, dets_right)
+
+        # HUD status only reflects confirmed, non-static VRUs — matches the
+        # same filter used for actual ALERT/SAFE logic above, so the on-
+        # screen status never contradicts what triggers the real alert.
+        def _real_vru(dets):
+            return any(d['class'] in VRU_CLASSES and d.get('confirmed') and not d.get('static')
+                       for d in dets)
+
+        left_zone  = left_alert_zone  if _real_vru(dets_left)  else 'FAR'
+        right_zone = right_alert_zone if _real_vru(dets_right) else 'FAR'
+
+        frame_left  = draw_hud(frame_left,  "LEFT",  fps, left_zone,  _real_vru(dets_left))
+        frame_right = draw_hud(frame_right, "RIGHT", fps, right_zone, _real_vru(dets_right))
+
+        combined = np.hstack((frame_left, frame_right))
+
+        with frame_lock:
+            latest_frame = combined
+
+except KeyboardInterrupt:
+    print("\n\nStopping GhostTrack...")
+
+finally:
+    send_safe()
+    cam_left.stop()
+    cam_right.stop()
+    if esp32 and esp32.is_open:
+        esp32.close()
+
+    print("\n" + "=" * 40)
+    print("  GHOSTTRACK STOPPED")
+    print("=" * 40)
+    print(f"  Total frames : {frame_count}")
+    print(f"  Total alerts : {alert_count}")
+    print(f"  Ghost Log    : {GHOST_LOG_PATH}")
+    print("=" * 40)
