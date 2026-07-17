@@ -21,15 +21,14 @@ vulnerable road users in these blind zones and alert the driver in real time.
 ## Team
 **S Leharin Nisha (Lead Creator & System Architect)**
 
-- Contribution: End-to-end system conceptualization, problem statement formulation, full-stack software development, web interface engineering, and training/deployment of the core machine learning models (best.pt). Developed baseline architecture independently over a 6-month timeline.
+Contribution: End-to-end system conceptualization, problem statement formulation, full-stack software development, web interface engineering, and training/deployment of the core machine learning models (best.pt). Developed baseline architecture independently over a 6-month timeline.
 
 **Rajamaran (Hardware Implementation Support)**
 
-- Contribution: Assisted with physical circuit assembly, connecting the ESP32 microcontroller with the radar module, LEDs, and servo motor peripherals during the hackathon phase.
-
+Contribution: Assisted with physical circuit assembly, connecting the ESP32 microcontroller with the radar module, LEDs, and servo motor peripherals during the hackathon phase.
 **Sumith (Hardware Implementation Support)**
 
-- Contribution: Assisted with physical circuit assembly, connecting the ESP32 microcontroller with the radar module, LEDs, and servo motor peripherals during the hackathon phase.
+Contribution: Assisted with physical circuit assembly, connecting the ESP32 microcontroller with the radar module, LEDs, and servo motor peripherals during the hackathon phase.
 ## Tech Stack
 - YOLOv8 (COCO + custom ghosttrack_best.pt)
 - Raspberry Pi 5 + ESP32
