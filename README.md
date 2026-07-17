@@ -37,7 +37,8 @@ Contribution: Assisted with physical circuit assembly, connecting the ESP32 micr
 
 ## Demo
 - Live Site: https://ghosttruck.onrender.com
-- 3D Model:  https://ghosttrack-team.github.io/indian-lorry-blindspot/
+- DrversApp:  https://ghosttrackdriveapp-git-7b2cba-leharinshainsha05-stacks-projects.vercel.app/
+- Journey: https://ghosttrack-journey-git-main-leharinshainsha05-stacks-projects.vercel.app/
 
 ## Model Training
 - Kaggle Notebook: https://www.kaggle.com/code/leharinnisha/ghosttrack
